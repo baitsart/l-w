@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+
+srt2lrc() {
+awk '
+function to_lrc(t) {
+    gsub(/,/, ".", t)
+    split(t, a, "[:.]")
+    return sprintf("[%02d:%02d.%02d]", a[1], a[2], a[3])
+}
+
+BEGIN {
+    last_text=""
+    start=""
+}
+
+/--> / {
+    split($0, a, " --> ")
+    start = a[1]
+    next
+}
+
+# eliminar índices tipo "1", "2", "3"
+/^[0-9]+$/ { next }
+
+# ignorar líneas vacías
+NF == 0 { next }
+
+{
+    gsub(/<[^>]+>/, "", $0)
+    gsub(/\[.*\]/, "", $0)
+
+    text = $0
+
+    if (start != "" && text != "" && text != last_text) {
+        print to_lrc(start) text
+        last_text = text
+    }
+}
+' "$1" > "${1%.srt}.lrc"
+}
+
+# uso
+srt2lrc "$1"

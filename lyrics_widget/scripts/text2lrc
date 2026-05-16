@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+check_internet() {
+  curl -Is --connect-timeout 5 https://www.letras.mus.br >/dev/null 2>&1
+}
+
+if [[ -z "$1" ]]; then
+
+  OPTION=$(zenity --list \
+    --title="Letra de la canción" \
+    --column="Opción" \
+    "Abrir archivo" \
+    "Descargar o ingresar texto" \
+    --width=300 --height=275)
+
+  [[ -z "$OPTION" ]] && exit 0
+
+  if [[ "$OPTION" == "Abrir archivo" ]]; then
+    INPUT=$(zenity --file-selection \
+      --title="Selecciona archivo de letra" \
+      --file-filter="Text files | *.txt")
+ else
+
+   INPUT=$(mktemp)  
+     
+   TITLE=$(playerctl metadata title 2>/dev/null)  
+   ARTIST=$(playerctl metadata artist 2>/dev/null)  
+     
+   if [[ -n "$TITLE" && -n "$ARTIST" ]]; then  
+     
+     if check_internet; then  
+     
+       DOWNLOADED=$($HOME/.config/lyrics_widget/scripts/fetch_lyrics "$ARTIST" "$TITLE")  
+
+if [[ -s "$DOWNLOADED" ]]; then
+  echo "✅ Letra descargada"
+  cp "$DOWNLOADED" "$INPUT"
+fi
+else
+  echo "❌ No se descargó letra"
+fi
+     fi  
+   fi  
+     
+zenity --text-info \
+  --editable \
+  --filename="$INPUT" \
+  --title="Pegar letra" \
+  --width=600 \
+  --height=400
+  
+  BASENAME=$(basename "$INPUT")
+  SONG_NAME="${BASENAME%.*}"
+  
+# intentar obtener título desde playerctl
+TITLE=$(playerctl metadata title 2>/dev/null)
+ARTIST=$(playerctl metadata artist 2>/dev/null)
+
+# armar nombre sugerido
+if [[ -n "$ARTIST" && -n "$TITLE" ]]; then
+  SUGGESTED="$ARTIST - $TITLE"
+elif [[ -n "$TITLE" ]]; then
+  SUGGESTED="$TITLE"
+else
+  SUGGESTED=""
+fi
+
+# si es temporal → pedir nombre (con sugerencia)
+if [[ "$INPUT" == /tmp/* ]]; then
+  SONG_NAME=$(yad --entry \
+    --title="Nombre de la canción" \
+    --text="Ingresa el nombre:" \
+    --entry-text="$SUGGESTED")
+  
+  [[ -z "$SONG_NAME" ]] && exit 0
+fi
+
+[[ -z "$INPUT" ]] && exit 0
+
+else
+  # 🟢 modo argumentos
+  INPUT="$1"
+  SONG_NAME="$2"
+
+  if [[ -z "$INPUT" || -z "$SONG_NAME" ]]; then
+    echo "Uso: $0 letra.txt \"NombreCancion\""
+    exit 1
+  fi
+fi
+
+ARTIST=$(playerctl metadata artist 2>/dev/null)
+TITLE=$(playerctl metadata title 2>/dev/null)
+ALBUM=$(playerctl metadata album 2>/dev/null)
+
+# obtener carpeta Música (XDG)
+MUSIC_DIR=$(xdg-user-dir MUSIC 2>/dev/null)
+
+# fallback si falla
+[[ -z "$MUSIC_DIR" ]] && MUSIC_DIR="$HOME/Música"
+
+BASE="$MUSIC_DIR/Lyrics"
+
+SAFE_ARTIST=$(echo "$ARTIST" | sed 's/[\/:*?"<>|]//g')
+SAFE_TITLE=$(echo "$TITLE" | sed 's/[\/:*?"<>|]//g')
+SAFE_ALBUM=$(echo "$ALBUM" | sed 's/[\/:*?"<>|]//g')
+
+echo "$SAFE_ARTIST/$SAFE_ALBUM"
+
+DIR="$BASE/$SAFE_ARTIST/$SAFE_ALBUM"
+mkdir -p "$DIR"
+
+OUTPUT="$DIR/$SAFE_ARTIST - $SAFE_TITLE.lrc"
+
+get_time() {
+  # tiempo real del mpv vía MPRIS
+  playerctl position 2>/dev/null
+}
+
+LINES=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && LINES+=("$line")
+done < "$INPUT"
+
+INDEX=0
+
+while [[ $INDEX -lt ${#LINES[@]} ]]; do
+
+  SELECTED=$(printf "%s\n" "${LINES[@]:$INDEX}" | zenity --list \
+    --title="Presiona cuando oigas la frase" \
+    --text="Selecciona la línea actual" \
+    --column="Letra" \
+    --width=850 --height=515)
+
+  if [[ -z "$SELECTED" ]]; then
+    exit 0
+  fi
+
+  TS=$(get_time)
+  
+  MIN=$(awk -v t="$TS" 'BEGIN { printf "%02d", int(t/60) }')
+  SEC=$(awk -v t="$TS" 'BEGIN { printf "%05.2f", (t%60) }')
+  
+  echo "[$MIN:$SEC]$SELECTED" >> "$OUTPUT"
+  
+  INDEX=$((INDEX + 1))
+
+done
+
+zenity --info \
+  --no-markup \
+  --text="LRC generado: $OUTPUT"
+  
+if zenity --question \
+  --title="Traducir letra" \
+  --text="¿Traducir automáticamente la letra al español?"; then
+
+  TRANSLATED=$(
+    ~/.config/lyrics_widget/scripts/translator "$OUTPUT"
+  )
+
+  OUTPUT="$TRANSLATED"
+fi

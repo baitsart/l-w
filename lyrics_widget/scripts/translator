@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+
+input="$1"
+out="${input}.translates"
+
+CACHE_DIR="$HOME/.cache/lyrics_trans"
+mkdir -p "$CACHE_DIR"
+
+translate_line() {
+  local txt="$1"
+
+  local key
+  key=$(printf "%s" "$txt" | md5sum | awk '{print $1}')
+  local cache_file="$CACHE_DIR/$key"
+
+  [[ -f "$cache_file" ]] && cat "$cache_file" && return
+
+  local tr
+  tr=$(trans -b -no-ansi :es "$txt" 2>/dev/null)
+
+  if [[ -z "$tr" ]]; then
+    tr=""
+  fi
+
+  tr=$(echo "$tr" | sed 's/^ *//;s/ *$//')
+
+  echo "$tr" > "$cache_file"
+  echo "$tr"
+}
+
+export -f translate_line
+export CACHE_DIR
+
+while IFS= read -r line; do
+
+  if [[ "$line" =~ ^(\[[0-9:.]+\])(.*) ]]; then
+    tag="${BASH_REMATCH[1]}"
+    txt="${BASH_REMATCH[2]}"
+
+    txt="${txt#"${txt%%[! ]*}"}"
+
+    if [[ -z "$txt" ]]; then
+      echo "$line"
+      continue
+    fi
+
+    tr=$(translate_line "$txt")
+
+    echo "$tag$txt" >> "$out"
+    
+    if [[ -n "$tr" && "$tr" != "$txt" ]]; then
+      echo "$tag<i>$tr</i>" >> "$out"
+    fi
+
+  else
+    echo "$line"
+  fi
+
+done < "$input"
+
+echo "1" > ~/.config/lyrics_widget/show_translation
+
+echo "$input"

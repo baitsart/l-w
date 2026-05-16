@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+
+ARTIST="$1"
+TITLE="$2"
+
+TMP=$(mktemp)
+
+slugify() {
+  echo "$1" \
+    | iconv -f utf8 -t ascii//TRANSLIT 2>/dev/null \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed 's/feat\..*//I' \
+    | sed 's/(.*)//g' \
+    | sed 's/\[.*\]//g' \
+    | sed 's/[^a-z0-9]/-/g' \
+    | sed 's/--*/-/g;s/^-//;s/-$//'
+}
+
+ARTIST_SLUG=$(slugify "$ARTIST")
+TITLE_SLUG=$(slugify "$TITLE")
+
+LETRAS_URL="https://www.letras.mus.br/$ARTIST_SLUG/$TITLE_SLUG/"
+
+python3 - <<EOF > "$TMP"
+from bs4 import BeautifulSoup
+import requests
+import re
+
+artist = """$ARTIST"""
+title = """$TITLE"""
+
+headers = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 "
+        "(KHTML, like Gecko) "
+        "Chrome/123 Safari/537.36"
+    )
+}
+
+# ----------------------------------------
+# VALIDAR MATCH
+# ----------------------------------------
+
+important_words = []
+
+for w in re.split(r"[^a-z0-9]+", title.lower()):
+
+    if len(w) >= 4:
+        important_words.append(w)
+
+# ----------------------------------------
+# LETRAS.MUS.BR
+# ----------------------------------------
+
+lyrics = ""
+
+try:
+
+    url = """$LETRAS_URL"""
+
+    html = requests.get(
+        url,
+        headers=headers,
+        timeout=20
+    ).text
+
+    page = html.lower()
+
+    score = 0
+
+    for w in important_words:
+        if w in page:
+            score += 1
+
+    # solo aceptar si realmente parece la canción
+    if score >= max(1, len(important_words) // 2):
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        containers = soup.select(
+            "div.lyric-original p"
+        )
+
+        parts = []
+
+        for c in containers:
+
+            text = c.get_text(
+                "\n",
+                strip=True
+            )
+
+            if text:
+                parts.append(text)
+
+        lyrics = "\n\n".join(parts).strip()
+
+except:
+    pass
+
+# ----------------------------------------
+# FALLBACK: GENIUS
+# ----------------------------------------
+
+if not lyrics:
+
+    slug = f"{artist}-{title}".lower()
+
+    slug = re.sub(r"\(.*?\)", "", slug)
+    slug = re.sub(r"\[.*?\]", "", slug)
+    slug = re.sub(r"feat\..*", "", slug)
+
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = re.sub(r"-+", "-", slug)
+    slug = slug.strip("-")
+
+    genius_url = f"https://genius.com/{slug}-lyrics"
+
+    try:
+
+        html = requests.get(
+            genius_url,
+            headers=headers,
+            timeout=20
+        ).text
+
+        soup = BeautifulSoup(
+            html,
+            "html.parser"
+        )
+
+        containers = soup.select(
+            '[data-lyrics-container="true"]'
+        )
+
+        parts = []
+
+        for c in containers:
+
+            text = c.get_text(
+                "\n",
+                strip=True
+            )
+
+            if text:
+                parts.append(text)
+
+        lyrics = "\n\n".join(parts).strip()
+
+    except:
+        pass
+
+# ----------------------------------------
+# LIMPIEZA
+# ----------------------------------------
+
+clean = []
+
+for line in lyrics.splitlines():
+
+    line = line.strip()
+
+    if not line:
+        clean.append("")
+        continue
+
+    if "Contributor" in line:
+        continue
+
+    if line.endswith("Lyrics"):
+        continue
+
+    clean.append(line)
+
+lyrics = "\n".join(clean)
+
+lyrics = re.sub(
+    r"\n{3,}",
+    "\n\n",
+    lyrics
+).strip()
+
+print(lyrics)
+EOF
+
+echo "$TMP"

@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+
+set -e
+
+# 🔥 detectar modo
+if [ $# -eq 1 ]; then
+    QUERY="$1"
+    ARTIST="$(echo "$QUERY" | awk '{print $1}')"
+    TITLE="$(echo "$QUERY" | cut -d' ' -f2-)"
+else
+    ARTIST="$1"
+    TITLE="$2"
+fi
+
+[ -z "$ARTIST" ] && echo "Falta artista" && exit 1
+[ -z "$TITLE" ] && echo "Falta título" && exit 1
+
+clean() {
+    echo "$1" | sed 's/[\\/:"*?<>|]//g'
+}
+
+ARTIST_C=$(clean "$ARTIST")
+TITLE_C=$(clean "$TITLE")
+
+BASE="$HOME/Música/Lyrics/$ARTIST_C"
+TMP="/tmp/lrc_yt"
+
+mkdir -p "$BASE"
+mkdir -p "$TMP"
+
+rm -f "$TMP"/*.vtt "$TMP"/*.lrc 2>/dev/null || true
+
+QUERY="$ARTIST $TITLE"
+echo "🔍 $QUERY"
+rm -f "$TMP"/*.vtt 2>/dev/null || true
+
+FOUND=0
+
+for URL in $(yt-dlp "ytsearch5:$QUERY" --print "%(webpage_url)s" --quiet); do
+    echo "🎯 $URL"
+
+    LANG=$(yt-dlp --list-subs "$URL" 2>/dev/null \
+    | awk 'NR>1 && $1 ~ /^[a-z]/ {print $1}' \
+    | head -n1)
+
+    [ -z "$LANG" ] && continue
+
+    echo "🌐 Idioma: $LANG"
+
+    rm -f "$TMP"/*.vtt 2>/dev/null || true
+
+    yt-dlp \
+      --skip-download \
+      --write-sub \
+      --sub-langs "$LANG" \
+      --sub-format vtt \
+      -o "$TMP/vid_%(id)s" \
+      "$URL" \
+      --quiet
+
+    for f in "$TMP"/*.vtt; do
+        [ -s "$f" ] || continue
+
+        OUT="$BASE/$TITLE_C.lrc"
+
+        awk '
+        function to_lrc_time(t) {
+            split(t, a, ":")
+            h = a[1]; m = a[2]; s = a[3]
+            sub(/\..*/, "", s)
+            total_m = h * 60 + m
+            return sprintf("[%02d:%02d.%02d]", total_m, s, 0)
+        }
+
+        /^[0-9]/ {
+            split($0, times, " --> ")
+            start = times[1]
+            getline text
+
+            gsub(/<[^>]+>/, "", text)
+            gsub(/&amp;/, "&", text)
+
+            if (text != "" && text != last) {
+                print to_lrc_time(start) text
+                last = text
+            }
+        }
+        ' "$f" > "$OUT"
+
+        if [ -s "$OUT" ]; then
+            echo "🎵 Guardado en: $OUT"
+            FOUND=1
+            break 2
+        else
+            rm -f "$OUT"
+        fi
+    done
+done
+
+if [ "$FOUND" -eq 1 ]; then
+    echo "✅ LRC OK"
+    exit 0
+else
+
+QUERY_LYRICS="$QUERY con letra"
+rm -f "$TMP"/*.vtt 2>/dev/null || true
+
+yt-dlp \
+  --js-runtimes node:/usr/bin/node \
+  --no-playlist \
+  --skip-download \
+  --write-auto-sub \
+  --write-sub \
+  --sub-langs "original" \
+  --sub-format vtt \
+  -o "$TMP/vid_%(id)s" \
+  "ytsearch1:$QUERY_LYRICS" \
+  --quiet
+
+FOUND=0
+
+for f in "$TMP"/*.vtt; do
+    [ -e "$f" ] || continue
+
+    OUT="$BASE/$TITLE_C.lrc"
+
+    awk '
+    function to_lrc_time(t) {
+        split(t, a, ":")
+        h = a[1]; m = a[2]; s = a[3]
+        sub(/\..*/, "", s)
+        total_m = h * 60 + m
+        return sprintf("[%02d:%02d.%02d]", total_m, s, 0)
+    }
+
+    /^[0-9]/ {
+        split($0, times, " --> ")
+        start = times[1]
+        getline text
+
+        gsub(/<[^>]+>/, "", text)
+        gsub(/&amp;/, "&", text)
+
+        if (text != "" && text != last) {
+            print to_lrc_time(start) text
+            last = text
+        }
+    }
+    ' "$f" > "$OUT"
+
+    echo "🎵 Guardado en: $OUT"
+    FOUND=1
+    break
+done
+
+if [ "$FOUND" -eq 1 ]; then
+    echo "✅ LRC OK"
+    exit 0
+else
+
+    echo "❌ Sin LRC"
+    exit 2
+fi
+
+fi

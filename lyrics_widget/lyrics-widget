@@ -1,0 +1,1925 @@
+#!/usr/bin/env python3
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gtk, GLib, Gdk,  Pango, PangoCairo
+
+import requests
+import cairo
+import re
+import threading
+import os
+import subprocess
+from difflib import SequenceMatcher
+import configparser
+
+# ---------------- METADATA ----------------
+
+CONFIG_DIR = os.path.expanduser("~/.config/lyrics_widget")
+
+WINDOW_FILE = os.path.join(CONFIG_DIR, "window.conf")
+
+THEMES_DIR = os.path.join(CONFIG_DIR, "themes")
+
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.ini")
+
+THEME_FILE = os.path.join(CONFIG_DIR, "theme.conf")
+
+SCRIPTS_DIR = os.path.join(CONFIG_DIR, "scripts")
+
+UI_FILE = os.path.join(CONFIG_DIR, "ui.conf")
+
+os.makedirs(CONFIG_DIR, exist_ok=True)
+os.makedirs(THEMES_DIR, exist_ok=True)
+os.makedirs(SCRIPTS_DIR, exist_ok=True)
+
+TRANSLATION_FLAG = os.path.join(
+    CONFIG_DIR,
+    "show_translation"
+)
+
+show_translation = os.path.exists(TRANSLATION_FLAG)
+
+SKIN_BASE_WIDTH = 1350
+SKIN_BASE_HEIGHT = 450
+
+DEFAULT_SCALE = 0.35
+
+PLAYER = None
+
+def get_player():
+    global PLAYER
+
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "-l"],
+            stderr=subprocess.DEVNULL
+        ).decode().splitlines()
+
+        preferred = [
+            "rhythmbox",
+            "clementine",
+            "vlc",
+            "mpv"
+        ]
+
+        for p in preferred:
+            for found in out:
+                if found.startswith(p):
+                    PLAYER = found
+                    return PLAYER
+
+        if out:
+            PLAYER = out[0]
+            return PLAYER
+
+    except:
+        pass
+
+    return None
+
+def get_position():
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "position"],
+            stderr=subprocess.DEVNULL
+        )
+        return float(out.strip())
+    except:
+        return 0.0
+
+
+def get_length():
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "metadata", "mpris:length"],
+            stderr=subprocess.DEVNULL
+        )
+        return int(out.strip()) / 1_000_000
+    except:
+        return 0
+
+
+def get_metadata(field):
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "metadata", field],
+            stderr=subprocess.DEVNULL
+        )
+        return out.decode().strip()
+    except:
+        return ""
+
+
+def get_album():
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "metadata", "album"],
+            stderr=subprocess.DEVNULL
+        )
+        return out.decode().strip()
+    except:
+        return "Unknown Album"
+
+def get_music_dir():
+    try:
+        out = subprocess.check_output(
+            ["xdg-user-dir", "MUSIC"],
+            stderr=subprocess.DEVNULL
+        )
+        path = out.decode().strip()
+
+        # fallback si devuelve vacío
+        if not path:
+            return os.path.expanduser("~/Música")
+
+        return path
+
+    except:
+        return os.path.expanduser("~/Música")
+
+# ---------------- NORMALIZE ----------------
+
+def normalize(text):
+    text = text.lower()
+
+    # basura común
+    text = re.sub(r"\b(song|album|official|video|lyrics)\b", "", text)
+
+    # conservar mixes/versiones
+    # text = re.sub(r"\(.*?\)", "", text)
+    text = re.sub(r"\[.*?\]", "", text)
+    text = re.sub(r"feat\.?.*", "", text)
+    text = re.sub(r"\bft\.?.*", "", text)
+
+    text = re.sub(r"\d+", "", text)
+    text = re.sub(r"[^\w\s]", " ", text)
+    text = re.sub(r"\s+", " ", text)
+
+    return text.strip()
+
+
+def similarity(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+def get_final_names(artist, title):
+    if search_override:
+        txt = normalize(search_override)
+
+        # 🔥 intentamos detectar artista real desde metadata si existe
+        meta_artist = normalize(get_metadata("artist"))
+        meta_title = normalize(get_metadata("title"))
+
+        txt_words = txt.split()
+        meta_words = meta_artist.split()
+
+        # 🔥 si coincide parcialmente con artista real → lo respetamos
+        if meta_words and len(set(meta_words) & set(txt_words)) >= 1:
+            artist = meta_artist
+            title = " ".join([w for w in txt_words if w not in meta_words])
+        else:
+            # fallback: todo es título
+            title = txt
+
+    return artist.strip(), title.strip()
+    
+def get_contrast_color(r, g, b):
+    luminance = 0.299 * r + 0.587 * g + 0.114 * b
+
+    if luminance > 0.65:
+        return "black"
+    else:
+        return "white"
+
+# ---------------- INDEX ----------------
+
+def build_index():
+    base = LYRICS_DIR
+    index = []
+
+    for root, dirs, files in os.walk(base):
+
+        for f in files:
+
+            if not f.endswith(".lrc"):
+                continue
+
+            full_path = os.path.join(root, f)
+
+            rel = os.path.relpath(full_path, base)
+
+            parts = rel.split(os.sep)
+
+            artist = ""
+            album = ""
+            title = f.replace(".lrc", "")
+
+            if len(parts) >= 3:
+                artist = parts[0]
+                album = parts[1]
+                title = os.path.splitext(parts[2])[0]
+                
+                # 🔥 quitar artista duplicado del filename
+                if artist:
+                
+                    norm_artist = normalize(artist)
+                    norm_title = normalize(title)
+                
+                    if norm_title.startswith(norm_artist):
+                
+                        title = re.sub(
+                            rf"^{re.escape(artist)}\s*-\s*",
+                            "",
+                            title,
+                            flags=re.I
+                        )
+
+            elif len(parts) == 2:
+                artist = parts[0]
+                title = os.path.splitext(parts[1])[0]
+
+            index.append({
+                "artist": normalize(artist),
+                "album": normalize(album),
+                "title": normalize(title),
+                "path": full_path
+            })
+
+    return index
+
+
+# ---------------- LRC ----------------
+
+def parse_lrc(file):
+    pattern = re.compile(r"\[(\d+):([\d.]+)\](.*)")
+    data = []
+
+    with open(file) as f:
+        for line in f:
+            m = pattern.match(line)
+            if m:
+                mnt = int(m.group(1))
+                sec = float(m.group(2))
+                txt = m.group(3).strip()
+                data.append((mnt * 60 + sec, txt))
+
+    return data
+
+def fetch_lrc_online(artist, title):
+    try:
+        url = "https://lrclib.net/api/get"
+
+        params = {
+            "artist_name": artist,
+            "track_name": title
+        }
+
+        r = requests.get(url, params=params, timeout=12)
+
+        if r.status_code == 200:
+            data = r.json()
+
+            if "syncedLyrics" in data and data["syncedLyrics"]:
+                return data["syncedLyrics"]
+
+    except Exception as e:
+        print("Error online:", e)
+
+    return None
+
+def fetch_lrc_youtube(artist, title):
+    import threading
+
+    key = f"{artist} - {title}"
+
+    # 🔥 evitar repetir
+    if key in YT_CACHE or key in YT_FAILED:
+        return None
+
+    # 🔥 evitar múltiples ejecuciones simultáneas
+    if hasattr(fetch_lrc_youtube, "running") and fetch_lrc_youtube.running:
+        return None
+
+    fetch_lrc_youtube.running = True
+
+    def worker():
+        try:
+            subprocess.run(
+                ["yt-lyrics", artist, title],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+            base = LYRICS_DIR
+
+            safe_artist = re.sub(r'[\\/:"*?<>|]+', "", artist)
+            safe_title = re.sub(r'[\\/:"*?<>|]+', "", title)
+
+            path = os.path.join(base, safe_artist, f"{safe_title}.lrc")
+
+            global lyrics, lyrics_source
+
+            if os.path.exists(path):
+                lyrics = parse_lrc(path)
+                lyrics_source = "YOUTUBE"
+
+                YT_CACHE.add(key)
+                print("🎧 YouTube OK (cached)")
+            else:
+                YT_FAILED.add(key)
+                print("❌ YouTube sin resultado (cached)")
+
+        except Exception as e:
+            YT_FAILED.add(key)
+            print("Error YouTube:", e)
+
+        finally:
+            fetch_lrc_youtube.running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    return None
+
+def make_lrc_path(artist, title, album="Unknown Album"):
+    artist, title = get_final_names(artist, title)
+
+    safe_artist = re.sub(r'[\\/:"*?<>|]+', "", artist).title()
+    safe_title = re.sub(r'[\\/:"*?<>|]+', "", title).title()
+    safe_album = re.sub(r'[\\/:"*?<>|]+', "", album).title()
+
+    album_dir = os.path.join(LYRICS_DIR, safe_artist, safe_album)
+    os.makedirs(album_dir, exist_ok=True)
+
+    return os.path.join(album_dir, f"{safe_title}.lrc")
+    
+   
+def format_time(sec):
+    m = int(sec // 60)
+    s = int(sec % 60)
+    return f"{m:02}:{s:02}"
+
+def safe_markup(text):
+
+    # permitir solo <i>
+    text = text.replace("&", "&amp;")
+    text = text.replace("<i>", "__ITALIC_OPEN__")
+    text = text.replace("</i>", "__ITALIC_CLOSE__")
+    text = text.replace("<", "&lt;")
+    text = text.replace(">", "&gt;")
+    text = text.replace("__ITALIC_OPEN__", "<i>")
+    text = text.replace("__ITALIC_CLOSE__", "</i>")
+
+    return text
+
+# ---------------- UI ----------------
+
+class LyricsWidget(Gtk.Window):
+    def __init__(self, load_lrc_func):
+        self.load_lrc_func = load_lrc_func
+        super().__init__()
+
+        self.set_decorated(False)
+        self.set_keep_above(True)
+        self.set_resizable(True)  # 👈 ahora GTK permite resize
+        self.set_app_paintable(True)
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
+        
+        # 🔥 crear skin primero
+        self.skin = None
+        
+        self.show_clock = False
+        self.resizable_mode = False
+        self.resize_timer = None
+        
+        self.theme_dir = CONFIG_DIR
+
+        self.bg_color = self.get_gtk_color()
+        
+        # 🔥 cargar theme antes de restaurar tamaño
+        self.load_theme()
+        
+        self.load_window_state()
+        
+        self.queue_draw()
+        
+        self.props.opacity = self.opacity
+        
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.ENTER_NOTIFY_MASK |
+            Gdk.EventMask.LEAVE_NOTIFY_MASK |
+            Gdk.EventMask.KEY_PRESS_MASK |
+            Gdk.EventMask.KEY_RELEASE_MASK |
+            Gdk.EventMask.SCROLL_MASK
+)
+
+
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual and screen.is_composited():
+            self.set_visual(visual)
+
+        self.set_app_paintable(True)
+        self.connect("draw", self.on_draw)
+        self.connect("configure-event", self.on_configure)
+        
+        self.watch_wallpaper()
+
+        self.connect("button-press-event", self.on_click)
+
+        self.prev_text = ""
+        self.curr_text = ""
+        self.next_text = ""
+        self.load_ui_state()
+        
+        self.clickable = True
+        self.always_on_top = True
+        
+        self.set_keep_above(self.always_on_top)
+        
+        self.ignore_configure = False
+        
+        self.show_all()
+        
+        # 🔥 esperar a que GTK cree la ventana REAL
+        
+        GLib.timeout_add(300, self.set_clickable)
+        
+        GLib.idle_add(self.queue_draw)
+
+    def get_scaled_skin_size(self):
+    
+        if not self.skin:
+            return (740, 250)
+    
+        sw = self.skin.get_width()
+        sh = self.skin.get_height()
+    
+        scale = DEFAULT_SCALE
+    
+        w = int(sw * scale)
+        h = int(sh * scale)
+    
+        # límites razonables
+        w = min(w, 1200)
+        h = min(h, 700)
+    
+        return (w, h)
+
+    def set_clickable(self):
+    
+        window = self.get_window()
+    
+        if not window:
+            return False
+    
+        alloc = self.get_allocation()
+    
+        if self.clickable:
+    
+            # toda la ventana clickeable
+            region = cairo.Region(
+                cairo.RectangleInt(
+                    0,
+                    0,
+                    alloc.width,
+                    alloc.height
+                )
+            )
+    
+        else:
+    
+            # todo transparente EXCEPTO esquina resize
+            region = cairo.Region()
+    
+            resize_corner = cairo.RectangleInt(
+                alloc.width - 28,
+                alloc.height - 28,
+                28,
+                28
+            )
+    
+            region.union(resize_corner)
+    
+        window.input_shape_combine_region(region, 0, 0)
+    
+        return False
+        
+    def on_configure(self, widget, event):
+    
+        # ignorar configure si no estamos en resize real
+        if not self.resizable_mode:
+            return False
+
+        if self.ignore_configure:
+            return False
+    
+        # cancelar timer anterior
+        if self.resize_timer:
+            GLib.source_remove(self.resize_timer)
+    
+        # guardar SOLO cuando termina resize
+        self.resize_timer = GLib.timeout_add(
+            1200,
+            self.delayed_save
+        )
+    
+        return False
+
+    def delayed_save(self):
+    
+        self.resize_timer = None
+    
+        current_w, current_h = self.get_size()
+    
+        # evitar tamaños basura
+        if current_w < 250 or current_h < 120:
+            print(f"⚠️ Ignorado tamaño basura: {current_w}x{current_h}")
+            return False
+    
+        self.save_window_state()
+    
+        return False
+
+    def finish_theme_resize(self):
+    
+        self.ignore_configure = False
+    
+        w, h = self.get_size()
+    
+        if w >= 250 and h >= 120:
+            self.save_window_state()
+    
+        return False
+
+    def toggle_resize(self, widget):
+    
+        self.resizable_mode = widget.get_active()
+    
+        # 🔥 guardar tamaño REAL ACTUAL antes de tocar decoraciones
+        alloc = self.get_allocation()
+    
+        current_w = alloc.width
+        current_h = alloc.height
+    
+        if self.resizable_mode:
+    
+            self.clickable = True
+            self.set_clickable()
+    
+            self.set_decorated(True)
+            self.set_resizable(True)
+    
+            # 🔥 restaurar tamaño exacto
+            GLib.idle_add(
+                lambda: self.resize(current_w, current_h)
+            )
+    
+            print("📐 Resize ON")
+    
+        else:
+    
+            if self.resize_timer:
+                GLib.source_remove(self.resize_timer)
+                self.resize_timer = None
+    
+            # 🔥 guardar tamaño ANTES de sacar bordes
+            self.save_window_state()
+    
+            self.set_decorated(False)
+    
+            # 🔥 volver a forzar tamaño exacto
+            GLib.idle_add(
+                lambda: self.resize(current_w, current_h)
+            )
+    
+            GLib.timeout_add(
+                300,
+                self.set_clickable
+            )
+    
+            print("📐 Resize OFF")
+    
+        self.queue_draw()
+        
+    def on_click(self, widget, event):
+    
+        # 🔥 resize manual esquina inferior derecha
+        if (
+            not self.clickable
+            and event.button == 1
+        ):
+    
+            alloc = self.get_allocation()
+    
+            corner_size = 28
+    
+            if (
+                event.x >= alloc.width - corner_size
+                and event.y >= alloc.height - corner_size
+            ):
+    
+                self.begin_resize_drag(
+                    Gdk.WindowEdge.SOUTH_EAST,
+                    event.button,
+                    int(event.x_root),
+                    int(event.y_root),
+                    event.time
+                )
+    
+                return True
+    
+        # 🔥 DOBLE CLICK IZQUIERDO → mover
+        if (
+            event.type == Gdk.EventType._2BUTTON_PRESS
+            and event.button == 1
+        ):
+    
+            self.begin_move_drag(
+                event.button,
+                int(event.x_root),
+                int(event.y_root),
+                event.time
+            )
+    
+            return True
+    
+        # 🔥 CLICK DERECHO → menú
+        if event.button == 3:
+    
+            menu = Gtk.Menu()
+    
+            def add_item(label, callback):
+                item = Gtk.MenuItem(label=label)
+                item.connect("activate", callback)
+                menu.append(item)
+    
+            def toggle_item(label, attr):
+                item = Gtk.CheckMenuItem(label=label)
+                item.set_active(getattr(self, attr, False))
+                item.connect(
+                    "toggled",
+                    lambda w: setattr(self, attr, w.get_active())
+                )
+                menu.append(item)
+    
+            add_item("Editar búsqueda", self.edit_name)
+            add_item("Sincronizar (min:seg)", self.sync_time)
+    
+            add_item("📝 Texto a Lyrics", self.text_to_lyrics)
+            add_item("🎨 Seleccionar tema", self.select_theme)
+            add_item("🌫️ Opacidad", self.change_opacity)
+    
+            menu.append(Gtk.SeparatorMenuItem())
+    
+            toggle_item("Mostrar reloj", "show_clock")
+    
+            resize_item = Gtk.CheckMenuItem(label="Redimensionar")
+            resize_item.set_active(self.resizable_mode)
+            resize_item.connect("toggled", self.toggle_resize)
+            menu.append(resize_item)
+    
+            menu.append(Gtk.SeparatorMenuItem())
+    
+            skin_toggle = Gtk.CheckMenuItem(label="Skins activados")
+            skin_toggle.set_active(self.use_skin)
+            skin_toggle.connect("toggled", self.toggle_skin)
+            menu.append(skin_toggle)
+    
+            click_toggle = Gtk.CheckMenuItem(label="Clickable")
+            click_toggle.set_active(self.clickable)
+            click_toggle.connect(
+                "toggled",
+                self.toggle_clickable
+            )
+            menu.append(click_toggle)
+    
+            top_toggle = Gtk.CheckMenuItem(
+                label="Mostrar siempre encima"
+            )
+            top_toggle.set_active(self.always_on_top)
+            top_toggle.connect(
+                "toggled",
+                self.toggle_always_on_top
+            )
+            menu.append(top_toggle)
+            
+            translate_toggle = Gtk.CheckMenuItem(
+                label="Mostrar traducción"
+            )
+            
+            translate_toggle.set_active(show_translation)
+            
+            translate_toggle.connect(
+                "toggled",
+                self.toggle_translation
+            )
+            
+            menu.append(translate_toggle)            
+    
+            add_item("Salir", Gtk.main_quit)
+    
+            menu.show_all()
+            menu.popup_at_pointer(event)
+    
+            return True
+    
+        return False            
+
+    def toggle_skin(self, widget):
+    
+        self.use_skin = widget.get_active()
+    
+        self.save_ui_state()
+    
+        self.queue_draw()
+        
+    def toggle_clickable(self, widget):
+        self.clickable = widget.get_active()
+    
+        self.set_clickable()
+    
+        print(
+            "🖱️ Clickable:",
+            "ON" if self.clickable else "CLICK-THROUGH"
+        )
+    
+    def toggle_always_on_top(self, widget):
+        self.always_on_top = widget.get_active()
+    
+        self.set_keep_above(self.always_on_top)
+    
+        print(
+            "📌 Siempre encima:",
+            "ON" if self.always_on_top else "OFF"
+        )
+
+    def toggle_translation(self, widget):
+    
+        global show_translation
+    
+        show_translation = widget.get_active()
+    
+        print(
+            "🌎 Traducción:",
+            "ON" if show_translation else "OFF"
+        )
+    
+        # persistencia
+        if show_translation:
+            open(TRANSLATION_FLAG, "w").close()
+        else:
+            try:
+                os.remove(TRANSLATION_FLAG)
+            except:
+                pass
+    
+        # recargar letras
+        global lyrics
+        lyrics = []
+    
+        if self.load_lrc_func:
+            self.load_lrc_func()
+    
+        self.queue_draw()
+    
+        GLib.timeout_add(
+            100,
+            self.set_clickable
+        )
+
+    def sync_time(self, widget):
+        dialog = Gtk.Dialog(title="Sincronizar tiempo", parent=self, flags=0)
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("Ej: 1:23")
+    
+        box = dialog.get_content_area()
+        box.add(entry)
+    
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+        dialog.show_all()
+    
+        if dialog.run() == Gtk.ResponseType.OK:
+            print("Sync a:", entry.get_text())
+    
+        dialog.destroy()
+
+    def edit_name(self, widget):
+        global search_override
+    
+        dialog = Gtk.Dialog(title="Editar búsqueda", parent=self, flags=0)
+        entry = Gtk.Entry()
+        
+        # 🔥 texto actual por defecto
+        artist = get_metadata("artist")
+        title = get_metadata("title")
+        
+        default_text = f"{artist} {title}".strip()
+        
+        entry.set_placeholder_text("Ej: Bjork Possibly Maybe")
+        
+        if search_override:
+            entry.set_text(search_override)
+        else:
+            entry.set_text(default_text)
+    
+        box = dialog.get_content_area()
+        box.add(entry)
+    
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.OK)
+    
+        dialog.show_all()
+    
+        if dialog.run() == Gtk.ResponseType.OK:
+            txt = entry.get_text().strip()
+            search_override = txt if txt else None
+    
+            print("🔍 Override:", search_override)
+    
+            # 🔥 fuerza recarga inmediata
+            global lyrics
+            lyrics = []
+
+            if self.load_lrc_func:
+                self.load_lrc_func()
+            
+        dialog.destroy()
+
+    def text_to_lyrics(self, widget):
+        try:
+            script_path = os.path.join(SCRIPTS_DIR, "text2lrc")
+    
+            subprocess.Popen(
+                [script_path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+    
+            print("📝 Lanzando text2lrc...")
+    
+        except Exception as e:
+            print("Error al ejecutar text2lrc:", e)
+    
+    def select_theme(self, widget):
+    
+        dialog = Gtk.Dialog(
+            title="Seleccionar tema",
+            parent=self,
+            flags=0
+        )
+    
+        dialog.set_default_size(760, 520)
+    
+        area = dialog.get_content_area()
+    
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_hexpand(True)
+        scroll.set_vexpand(True)
+        area.add(scroll)
+    
+        flow = Gtk.FlowBox()
+        flow.set_valign(Gtk.Align.START)
+        flow.set_halign(Gtk.Align.FILL)
+        flow.set_hexpand(True)
+        flow.set_vexpand(True)
+        
+        flow.set_max_children_per_line(3)
+        flow.set_selection_mode(Gtk.SelectionMode.NONE)
+        flow.set_row_spacing(15)
+        flow.set_column_spacing(15)
+        flow.set_margin_top(15)
+        flow.set_margin_bottom(15)
+        flow.set_margin_start(15)
+        flow.set_margin_end(15)
+    
+        scroll.add(flow)
+    
+        for name in os.listdir(THEMES_DIR):
+    
+            path = os.path.join(THEMES_DIR, name)
+    
+            if not os.path.isdir(path):
+                continue
+    
+            preview = os.path.join(path, "preview.png")
+    
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=8
+            )
+    
+            btn = Gtk.Button()
+    
+            inner = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=6
+            )
+    
+            if os.path.exists(preview):
+    
+                image = Gtk.Image.new_from_file(preview)
+    
+                inner.pack_start(image, True, True, 0)
+
+            label = Gtk.Label()
+
+            safe_name = GLib.markup_escape_text(name)
+                
+            label.set_markup(
+                f"<span size='large'><b>{safe_name}</b></span>\n"
+                f"<small>themes/{safe_name}</small>"
+                )
+            
+            label.set_xalign(0.5)
+    
+            inner.pack_start(label, False, False, 0)
+            
+            # 🔥 resaltar tema activo
+            current_theme = "default"
+            
+            conf = configparser.ConfigParser()
+            conf.read(THEME_FILE)
+            
+            if conf.has_section("theme"):
+                current_theme = conf.get(
+                    "theme",
+                    "name",
+                    fallback="default"
+                )
+            
+            if name == current_theme:
+                btn.get_style_context().add_class(
+                    "suggested-action"
+                )
+    
+            def apply_theme(button, theme_name=name):
+            
+                conf = configparser.ConfigParser()
+            
+                conf["theme"] = {
+                    "name": theme_name
+                }
+            
+                with open(THEME_FILE, "w") as f:
+                    conf.write(f)
+            
+                print("🎨 Tema:", theme_name)
+            
+                self.load_theme()
+                
+                self.ignore_configure = True
+                
+                if self.skin:
+                
+                    new_w, new_h = self.get_scaled_skin_size()
+                
+                    GLib.idle_add(
+                        lambda: self.resize(new_w, new_h)
+                    )
+                
+                GLib.timeout_add(
+                    500,
+                    self.finish_theme_resize
+                )
+                
+                self.queue_draw()
+            
+                dialog.response(Gtk.ResponseType.OK)
+            
+            btn.add(inner)
+            btn.connect("clicked", apply_theme)
+            
+            flow.add(btn)
+            
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def change_opacity(self, widget):
+    
+        try:
+            current = str(round(self.opacity, 2))
+    
+            result = subprocess.check_output([
+                "zenity",
+                "--scale",
+                "--title=Opacidad",
+                "--text=Transparencia del widget",
+                "--min-value=10",
+                "--max-value=100",
+                f"--value={int(self.opacity * 100)}"
+            ]).decode().strip()
+    
+            if not result:
+                return
+    
+            self.opacity = float(result) / 100.0
+            
+            self.props.opacity = self.opacity
+    
+            theme_name = "default"
+    
+            conf = configparser.ConfigParser()
+            conf.read(THEME_FILE)
+    
+            if conf.has_section("theme"):
+                theme_name = conf.get("theme", "name", fallback="default")
+    
+            theme_config = os.path.join(
+                THEMES_DIR,
+                theme_name,
+                "config.ini"
+            )
+    
+            style = configparser.ConfigParser()
+            style.read(theme_config)
+    
+            if not style.has_section("style"):
+                style["style"] = {}
+    
+            style["style"]["opacity"] = str(self.opacity)
+    
+            with open(theme_config, "w") as f:
+                style.write(f)
+    
+            self.queue_draw()
+    
+            print("🌫️ Nueva opacidad:", self.opacity)
+    
+        except Exception as e:
+            print("Error opacidad:", e)
+            
+    def mark_sync_point(self):
+        global sync_index, sync_start_time, sync_lines
+
+        t = get_position()
+
+        if sync_index == 0:
+            sync_start_time = t
+
+        rel_time = t - sync_start_time
+        line = sync_lines[sync_index]
+
+        print(f"[{rel_time:.2f}] {line}")
+
+        if not hasattr(self, "sync_result"):
+            self.sync_result = []
+
+        self.sync_result.append((rel_time, line))
+
+        sync_index += 1
+        self.show_next_sync_line()
+
+    def finish_sync_mode(self):
+        global sync_mode, sync_output_path
+
+        sync_mode = False
+
+        if not hasattr(self, "sync_result"):
+            print("Nada sincronizado")
+            return
+
+        os.makedirs(os.path.dirname(sync_output_path), exist_ok=True)
+
+        with open(sync_output_path, "w") as f:
+            for t, line in self.sync_result:
+                m = int(t // 60)
+                s = t % 60
+                f.write(f"[{m:02}:{s:05.2f}]{line}\n")
+
+        print("💾 LRC guardado:", sync_output_path)
+
+        self.sync_result = []
+
+    def show_next_sync_line(self):
+        global sync_index, sync_lines
+    
+        if sync_index < len(sync_lines):
+            line = sync_lines[sync_index]
+            self.set_lines("", line, "")
+            print(f"🎤 Línea {sync_index + 1}/{len(sync_lines)}: {line}")
+        else:
+            print("✅ No hay más líneas. Puedes finalizar con finish_sync_mode()")
+        
+    def get_gtk_color(self):
+    
+        try:
+    
+            # --------------------------
+            # DARK / LIGHT MODE
+            # --------------------------
+    
+            out = subprocess.check_output([
+                "gsettings",
+                "get",
+                "org.gnome.desktop.interface",
+                "color-scheme"
+            ]).decode()
+    
+            mode = "-dark" if "prefer-dark" in out else ""
+    
+            # --------------------------
+            # WALLPAPER URI
+            # --------------------------
+    
+            uri = subprocess.check_output([
+                "gsettings",
+                "get",
+                "org.gnome.desktop.background",
+                f"picture-uri{mode}"
+            ]).decode().strip()
+    
+            uri = uri.strip("'")
+    
+            if uri.startswith("file://"):
+                wallpaper = uri[7:]
+            else:
+                wallpaper = uri
+    
+            # --------------------------
+            # DOMINANT COLOR REAL
+            # --------------------------
+    
+            cmd = f"""
+    convert "{wallpaper}" -resize 100x100 -colors 16 -depth 8 \
+    -format %c histogram:info:- | \
+    awk -F'[(), ]+' '
+    function rgb_to_hue(r,g,b){{
+        r/=255; g/=255; b/=255;
+    
+        max=(r>g?r:g);
+        max=(max>b?max:b);
+    
+        min=(r<g?r:g);
+        min=(min<b?min:b);
+    
+        d=max-min;
+    
+        if(d==0) return -1;
+    
+        if(max==r) h=(g-b)/d;
+        else if(max==g) h=2+(b-r)/d;
+        else h=4+(r-g)/d;
+    
+        h*=60;
+    
+        if(h<0) h+=360;
+    
+        return h;
+    }}
+    
+    {{
+        count=$1;
+        r=$3;
+        g=$4;
+        b=$5;
+    
+        max=(r>g?r:g);
+        max=(max>b?max:b);
+    
+        min=(r<g?r:g);
+        min=(min<b?min:b);
+    
+        sat=max-min;
+    
+        if(sat < 25) next;
+    
+        score = count * (sat + 10);
+    
+        printf("%f %d %d %d\\n", score, r, g, b);
+    }}
+    ' | sort -nr | head -n1
+    """
+    
+            out = subprocess.check_output(
+                cmd,
+                shell=True
+            ).decode().strip()
+    
+            parts = out.split()
+    
+            r = int(parts[1]) / 255
+            g = int(parts[2]) / 255
+            b = int(parts[3]) / 255
+    
+            return (
+                round(r, 3),
+                round(g, 3),
+                round(b, 3)
+            )
+    
+        except Exception as e:
+    
+            print("Wallpaper color error:", e)
+    
+            return (0.12, 0.12, 0.12)
+    def watch_wallpaper(self):
+    
+        def worker():
+    
+            cmd = [
+                "gsettings",
+                "monitor",
+                "org.gnome.desktop.background",
+            ]
+    
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True
+            )
+    
+            for line in proc.stdout:
+    
+                print("🖼️ New color background")
+    
+                new_color = self.get_gtk_color()
+    
+                if new_color != self.bg_color:
+    
+                    self.bg_color = new_color
+    
+                    GLib.idle_add(self.queue_draw)
+    
+        threading.Thread(
+            target=worker,
+            daemon=True
+        ).start()
+
+    def get_skin_average_color(self, surface):
+    
+        try:
+            data = surface.get_data()
+            w = surface.get_width()
+            h = surface.get_height()
+            stride = surface.get_stride()
+    
+            r_total = 0
+            g_total = 0
+            b_total = 0
+            count = 0
+    
+            for y in range(0, h, 4):
+                for x in range(0, w, 4):
+    
+                    i = y * stride + x * 4
+    
+                    b = data[i]
+                    g = data[i + 1]
+                    r = data[i + 2]
+    
+                    r_total += r
+                    g_total += g
+                    b_total += b
+    
+                    count += 1
+    
+            return (
+                (r_total / count) / 255,
+                (g_total / count) / 255,
+                (b_total / count) / 255
+            )
+    
+        except Exception as e:
+    
+            print("Skin color error:", e)
+    
+            return self.bg_color
+
+    def make_click_through(self, widget):
+        window = self.get_window()
+        if window:
+            region = cairo.Region()
+            window.input_shape_combine_region(region, 0, 0)
+            
+    def load_position(self):
+        try:
+            with open(POS_FILE) as f:
+                x, y = map(int, f.read().split(","))
+                self.move(x, y)
+        except:
+            self.move(100, 100)
+
+    def save_position(self):
+        x, y = self.get_position()
+        with open(POS_FILE, "w") as f:
+            f.write(f"{x},{y}")
+            
+    def load_ui_state(self):
+    
+        conf = configparser.ConfigParser()
+        conf.read(UI_FILE)
+    
+        self.use_skin = conf.getboolean(
+            "ui",
+            "use_skin",
+            fallback=True
+        )
+    
+    def save_ui_state(self):
+    
+        conf = configparser.ConfigParser()
+    
+        conf["ui"] = {
+            "use_skin": str(self.use_skin)
+        }
+    
+        with open(UI_FILE, "w") as f:
+            conf.write(f)
+    
+    def load_window_state(self):
+    
+        default_w, default_h = self.get_scaled_skin_size()            
+    
+        try:
+            with open(WINDOW_FILE) as f:
+    
+                data = f.read().split(",")
+    
+                x = int(data[0])
+                y = int(data[1])
+                w = int(data[2])
+                h = int(data[3])
+    
+                if w < 250 or h < 120:
+                    raise Exception("tamaño inválido")
+    
+                GLib.idle_add(lambda: self.move(x, y))
+                GLib.idle_add(lambda: self.resize(w, h))
+    
+                print(f"📦 Restaurado: {w}x{h}")
+    
+        except Exception as e:
+    
+            print("No window.conf:", e)
+    
+            GLib.idle_add(lambda: self.move(100, 100))
+            GLib.idle_add(lambda: self.resize(default_w, default_h))
+    
+    def save_window_state(self):
+    
+        x, y = self.get_position()
+    
+        w, h = self.get_size()
+    
+        if w < 250 or h < 120:
+            print(f"⚠️ Ignorado tamaño basura: {w}x{h}")
+            return
+    
+        with open(WINDOW_FILE, "w") as f:
+            f.write(f"{x},{y},{w},{h}")
+    
+        print(f"💾 Guardado REAL: {w}x{h}")   
+
+    def load_theme(self):
+        conf = configparser.ConfigParser()
+        conf.read(THEME_FILE)
+    
+        theme_name = conf.get("theme", "name", fallback="default")
+        base = os.path.join(THEMES_DIR, theme_name)
+    
+        self.skin = None
+        
+        # 🔥 fallback inicial
+        self.skin_color = self.bg_color
+    
+        skin_path = os.path.join(base, "skin.png")
+    
+        if os.path.exists(skin_path):
+    
+            self.skin = cairo.ImageSurface.create_from_png(skin_path)
+    
+            # 🔥 color promedio de la skin
+            self.skin_color = self.get_skin_average_color(self.skin)
+            
+        style = configparser.ConfigParser()
+        style.read(os.path.join(base, "config.ini"))
+    
+        self.padding = int(style.get("style", "padding", fallback=15))
+        self.radius = int(style.get("style", "radius", fallback=25))
+        self.opacity = float(style.get("style", "opacity", fallback=1.0))
+        self.font_main = int(style.get("style", "font_main", fallback=20))
+        self.font_secondary = int(style.get("style", "font_secondary", fallback=14))    
+
+
+    def draw_rounded_rect(self, cr, x, y, w, h, r):
+        cr.new_sub_path()
+        cr.arc(x + w - r, y + r, r, -1.57, 0)
+        cr.arc(x + w - r, y + h - r, r, 0, 1.57)
+        cr.arc(x + r, y + h - r, r, 1.57, 3.14)
+        cr.arc(x + r, y + r, r, 3.14, 4.71)
+        cr.close_path()
+
+    def on_draw(self, widget, cr):
+        
+        w, h = self.get_allocation().width, self.get_allocation().height
+        
+        # solo limpiar con fondo transparente implícito
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+    
+        if self.skin and self.use_skin:
+            r, g, b = self.skin_color
+        else:
+            r, g, b = self.bg_color
+        
+        contrast = get_contrast_color(r, g, b)
+        
+        if contrast == "black":
+        
+            main_color = (0, 0, 0, 1)
+            secondary_color = (0.15, 0.15, 0.15, 0.85)
+        
+        else:
+        
+            main_color = (1, 1, 1, 1)
+            secondary_color = (0.8, 0.8, 0.8, 0.85)        
+    
+        # -------------------------
+        # LIMPIEZA REAL DEL CANVAS
+        # -------------------------
+        cr.set_operator(cairo.OPERATOR_CLEAR)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+    
+        # -------------------------
+        # CLIP (bordes redondeados)
+        # -------------------------
+        self.draw_rounded_rect(cr, 0, 0, w, h, self.radius)
+        cr.clip()
+        
+        # -------------------------
+        # FONDO BASE: SKIN (PURA IMAGEN)
+        # -------------------------
+        if self.skin and self.use_skin:
+        
+            sw = self.skin.get_width()
+            sh = self.skin.get_height()
+        
+            cr.save()
+        
+            # usar la imagen directamente SIN pattern raro
+            scale_x = w / sw
+            scale_y = h / sh
+            
+            cr.scale(scale_x, scale_y)
+            cr.set_source_surface(self.skin, 0, 0)
+            cr.paint()
+        
+            cr.restore()
+        
+        # -------------------------
+        # -------------------------
+        # BACKGROUND DECISION CLARA (sin mezcla)
+        # -------------------------
+        
+        if self.skin and self.use_skin:
+            # 🔥 skin puro total
+            pass
+        else:
+            r, g, b = self.bg_color
+        
+            # usar opacidad configurable
+            cr.set_source_rgba(
+                r,
+                g,
+                b,
+                self.opacity
+            )
+        
+            cr.paint()
+    
+        # -------------------------
+        # BLUR SIMULADO (solo sin skin)
+        # -------------------------
+        if not (self.skin and self.use_skin):
+        
+            r, g, b = self.bg_color
+        
+            for i in range(4):
+                alpha = 0.02
+                offset = i * 2
+        
+                self.draw_rounded_rect(
+                    cr,
+                    offset,
+                    offset,
+                    w - offset * 2,
+                    h - offset * 2,
+                    self.radius
+                )
+        
+                cr.set_source_rgba(r, g, b, alpha)
+                cr.fill()
+    
+        # -------------------------
+        # BRILLO SUPERIOR
+        # -------------------------
+        if not (self.skin and self.use_skin):
+            gradient = cairo.LinearGradient(0, 0, 0, h)
+            gradient.add_color_stop_rgba(0, 1, 1, 1, 0.18)
+            gradient.add_color_stop_rgba(1, 1, 1, 1, 0.0)
+        
+            cr.set_source(gradient)
+            cr.paint()
+            
+        # -------------------------
+        # TEXTO (Pango)
+        # -------------------------
+        layout = PangoCairo.create_layout(cr)
+    
+        main_size = max(12, int(self.font_main * (h / 220)))
+        sec_size = max(10, int(self.font_secondary * (h / 220)))
+    
+        # prev
+        layout.set_markup(safe_markup(self.prev_text))
+        layout.set_font_description(Pango.FontDescription(f"Sans {sec_size}"))
+        layout.set_width((w - 40) * Pango.SCALE)
+        layout.set_alignment(Pango.Alignment.CENTER)
+        layout.set_wrap(Pango.WrapMode.WORD_CHAR)
+    
+        cr.set_source_rgba(*secondary_color)
+        cr.move_to(20, h * 0.22)
+        PangoCairo.show_layout(cr, layout)
+    
+        # current
+        layout.set_markup(safe_markup(self.curr_text))
+        layout.set_font_description(Pango.FontDescription(f"Sans Bold {main_size}"))
+    
+        cr.set_source_rgba(*main_color)
+        cr.move_to(20, h * 0.42)
+        PangoCairo.show_layout(cr, layout)
+    
+        # next
+        layout.set_markup(safe_markup(self.next_text))
+        layout.set_font_description(Pango.FontDescription(f"Sans {sec_size}"))
+    
+        cr.set_source_rgba(*secondary_color)
+        cr.move_to(20, h * 0.72)
+        PangoCairo.show_layout(cr, layout)
+
+        # ---------------- CLOCK ----------------
+        if self.show_clock:
+        
+            pos = get_position()
+            length = get_length()
+        
+            if length > 0:
+                txt = f"{format_time(pos)} / {format_time(length)}"
+            else:
+                txt = format_time(pos)
+        
+            clock_layout = PangoCairo.create_layout(cr)
+            clock_layout.set_text(txt, -1)
+            clock_layout.set_font_description(Pango.FontDescription("Sans 11"))
+        
+            margin = int(h * 0.08)
+        
+            text_w, text_h = clock_layout.get_size()
+            text_w = text_w / Pango.SCALE
+            text_h = text_h / Pango.SCALE
+        
+            cr.set_source_rgba(1, 1, 1, 0.85)
+        
+            cr.move_to(
+                (w - text_w) / 2,
+                h - margin - text_h
+            )
+        
+            PangoCairo.show_layout(cr, clock_layout)
+
+    def set_lines(self, prev, curr, next_):
+        self.prev_text = prev or ""
+        self.curr_text = curr or ""
+        self.next_text = next_ or ""
+    
+        self.queue_draw()
+        
+
+# ---------------- GLOBALS ----------------
+
+MUSIC_DIR = get_music_dir()
+LYRICS_DIR = os.path.join(MUSIC_DIR, "Lyrics")    
+
+os.makedirs(LYRICS_DIR, exist_ok=True)
+
+sync_mode = False
+sync_lines = []
+sync_index = 0
+sync_start_time = 0
+sync_output_path = ""
+
+lyrics = []
+lyrics_index = build_index()
+lyrics_source = ""
+search_override = None
+YT_CACHE = set()
+YT_FAILED = set()
+
+# ---------------- MAIN ----------------
+
+def main():
+    current_song = [""]
+
+    def load_lrc():
+        nonlocal current_song
+        global lyrics, lyrics_source
+    
+        artist = get_metadata("artist")
+        title = get_metadata("title")
+    
+        if not artist and not title:
+            win.set_lines("", "-", "")
+            return
+    
+        # ---------------------------
+        # TARGET REAL (override o canción actual)
+        # ---------------------------
+        if search_override:
+            target = normalize(search_override)
+        else:
+            target = normalize(f"{artist} {title}")
+    
+        print("TARGET:", target)
+    
+        # ---------------------------
+        # MATCH LOCAL INDEX
+        # ---------------------------
+        
+        best_score = 0
+        best_match = None
+        
+        norm_title = normalize(title)
+        norm_artist = normalize(artist)
+        
+        # ---------------------------------
+        # 1. MATCH EXACTO PRIMERO
+        # ---------------------------------
+        
+        for item in lyrics_index:
+        
+            item_title = normalize(item["title"])
+            item_artist = normalize(item["artist"])
+        
+            if (
+                item_title == norm_title
+                and item_artist == norm_artist
+            ):
+                best_match = item["path"]
+                best_score = 1.0
+        
+                print("✅ MATCH EXACTO")
+        
+                break
+        
+        # ---------------------------------
+        # 2. FALLBACK DIFUSO
+        # ---------------------------------
+        
+        if not best_match:
+        
+            for item in lyrics_index:
+        
+                item_title = normalize(item["title"])
+                item_artist = normalize(item["artist"])
+        
+                title_score = similarity(item_title, norm_title)
+                artist_score = similarity(item_artist, norm_artist)
+        
+                # más estricto
+                if title_score < 0.75:
+                    continue
+        
+                score = (
+                    title_score * 0.8
+                    + artist_score * 0.2
+                )
+        
+                if score > best_score:
+                    best_score = score
+                    best_match = item["path"]
+        
+        print("BEST SCORE:", best_score)
+    
+        # ---------------------------
+        # SI ES BUEN MATCH LOCAL
+        # ---------------------------
+        
+        # umbral más estricto
+        if best_score > 0.75 and best_match:
+    
+            print("Lyrics encontrados:", best_match)
+    
+            load_path = best_match
+            
+            if show_translation:
+            
+                translated = best_match + ".translates"
+            
+                if os.path.exists(translated):
+                    load_path = translated
+            
+            lyrics = parse_lrc(load_path)
+            lyrics_source = f"LOCAL: {os.path.basename(best_match)}"
+
+            # 🔥 reset automático
+            if search_override:
+                globals()["search_override"] = None
+                print("🔄 Override auto-reset")
+
+            print("📁 Archivo local:", best_match)
+    
+            if lyrics:
+                GLib.idle_add(
+                    win.set_lines,
+                    "",
+                    lyrics[0][1],
+                    lyrics[1][1] if len(lyrics) > 1 else ""
+                )
+    
+            return
+    
+        # ---------------------------
+        # LRCLIB ONLINE
+        # ---------------------------
+        print("Buscando en LRCLIB...")
+    
+        lrc_text = fetch_lrc_online(artist, title)
+    
+        if lrc_text:
+
+            album = get_album()
+
+            path = make_lrc_path(
+                artist,
+                title,
+                album
+            )
+
+            if os.path.exists(path) and not search_override:
+                print("♻️ Ya existe:", path)
+            else:
+                with open(path, "w") as f:
+                    f.write(lrc_text)
+
+            lyrics = []
+
+            for line in lrc_text.split("\n"):
+                m = re.match(r"\[(\d+):([\d.]+)\](.*)", line)
+
+                if m:
+                    mnt = int(m.group(1))
+                    sec = float(m.group(2))
+                    txt = m.group(3).strip()
+
+                    lyrics.append((mnt * 60 + sec, txt))
+
+            lyrics_source = "LRCLIB"
+
+            # 🔥 reset automático
+            if search_override:
+                globals()["search_override"] = None
+                print("🔄 Override auto-reset")
+
+            print("✅ LRCLIB OK")
+
+        else:
+
+            # ---------------------------
+            # YOUTUBE FALLBACK
+            # ---------------------------
+            print("❌ LRCLIB falló → YouTube fallback...")
+
+            yt_lrc = fetch_lrc_youtube(artist, title)
+
+            if yt_lrc:
+
+                album = get_album()
+
+                path = make_lrc_path(
+                    artist,
+                    title,
+                    album
+                )
+
+                if os.path.exists(path) and not search_override:
+                    print("♻️ Ya existe:", path)
+                else:
+                    with open(path, "w") as f:
+                        for t, txt in yt_lrc:
+                            m = int(t // 60)
+                            s = t % 60
+                            f.write(f"[{m:02}:{s:05.2f}]{txt}\n")
+
+                lyrics = yt_lrc
+                lyrics_source = "YOUTUBE"
+
+                # 🔥 reset automático
+                if search_override:
+                    globals()["search_override"] = None
+                    print("🔄 Override auto-reset")
+
+                print("🎧 YouTube OK")
+
+            else:
+                lyrics = []
+                print("🙆‍♂️ Nada encontrado")    
+        # ---------------------------
+        # UPDATE UI INICIAL
+        # ---------------------------
+        if lyrics:
+            win.set_lines(
+                "",
+                lyrics[0][1],
+                lyrics[1][1] if len(lyrics) > 1 else ""
+            )
+    
+    def check_song_change():
+        artist = get_metadata("artist")
+        title = get_metadata("title")
+
+        song = f"{artist} - {title}"
+
+        if song != current_song[0]:
+            current_song[0] = song
+
+            # limpiar inmediatamente
+            global lyrics
+            lyrics = []
+
+            win.set_lines("", f"{artist} - {title}", "")
+
+            load_lrc()
+
+        return True
+    
+    def update():
+    
+        # 🔥 SI NO HAY LETRAS, SOLO MOSTRAR TÍTULO FIJO
+        if not lyrics:
+            artist = get_metadata("artist")
+            title = get_metadata("title")
+            
+            if not artist and not title:
+                win.set_lines("", "-", "")
+                return True
+            
+            if not lyrics:
+                win.set_lines("", f"{artist} - {title}", "")
+                return True
+    
+        # reloj
+        if win.show_clock:
+            win.queue_draw()
+    
+        # lyrics sync
+    
+        t = globals()["get_position"]()
+    
+        first_time = lyrics[0][0] if lyrics else 0
+        
+        if t < first_time:
+            artist = get_metadata("artist")
+            title = get_metadata("title")
+        
+            win.set_lines(
+                "",
+                f"{artist} — {title}",
+                ""
+            )
+    
+            return True
+        
+        idx = 0
+        for i in range(len(lyrics)):
+            if lyrics[i][0] <= t:
+                idx = i
+            else:
+                break
+    
+        prev = lyrics[idx - 1][1] if idx > 0 else ""
+        curr = lyrics[idx][1]
+        next_ = lyrics[idx + 1][1] if idx + 1 < len(lyrics) else ""
+    
+        win.set_lines(prev, curr, next_)
+    
+        return True
+        
+    win = LyricsWidget(load_lrc)
+
+    GLib.timeout_add(1000, check_song_change)
+    GLib.timeout_add(2000, update)
+
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    lyrics = []
+    print("Lyrics Widget")
+    main()
